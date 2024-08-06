@@ -87,6 +87,28 @@ class ConvBNActivation(nn.Sequential):
                                                          bias=False),
                                                norm_layer(output_channel),
                                                activation_layer())
+        
+# SE模块：注意力机制
+class SqueezeExcitation(nn.Module):
+    def __init__(self,
+                 input_channel: int,  # block input channel
+                 expand_channel: int,  # block expand channel 第一个1X1卷积扩展之后的channel
+                 squeeze_factor: int = 4):
+        super(SqueezeExcitation, self).__init__()
+        squeeze_c = input_channel // squeeze_factor  # 第一个全连接层个数等于输入特征的1/4
+        self.fc1 = nn.Conv2d(expand_channel, squeeze_c, 1)  # 压缩特征
+        self.ac1 = nn.SiLU()  # alias Swish
+        self.fc2 = nn.Conv2d(squeeze_c, expand_channel, 1)  # 拓展特征
+        self.ac2 = nn.Sigmoid()
+
+    def forward(self, x: Tensor) -> Tensor:
+        scale = F.adaptive_avg_pool2d(x, output_size=(1, 1))  # 全局平均池化
+        scale = self.fc1(scale)
+        scale = self.ac1(scale)
+        scale = self.fc2(scale)
+        scale = self.ac2(scale)
+        return scale * x  # 与输入的特征进行相乘
+    
 """
 CBAM (Convolutional Block Attention Module)
 https://arxiv.org/abs/1807.06521
@@ -137,14 +159,14 @@ class CBAM(nn.Module):
     
 # 每个MBconv的配置参数
 class InvertedResidualConfig:
-    # kernel_size, in_channel, out_channel, exp_ratio, strides, use_cbam, drop_connect_rate
+    # kernel_size, in_channel, out_channel, exp_ratio, strides, use_se, drop_connect_rate
     def __init__(self,
                  kernel: int,  # 3 or 5 论文中的卷积核大小有3和5
                  input_channel: int,
                  out_channel: int,
                  expanded_ratio: int,  # 1 or 6 #第一个1x1卷积层的扩展倍数，论文中有1和6
                  stride: int,  # 1 or 2
-                 use_cbam: bool,  # True 因为每个MBConv都使用CBAM模块 所以传入的参数是true
+                 use_se: bool,  # True 因为每个MBConv都使用CBAM模块 所以传入的参数是true
                  drop_rate: float,  # 随机失活比例
                  index: str,  # 1a, 2a, 2b, ... 用了记录当前MBconv当前的名称
                  width_coefficient: float):  # 网络宽度的倍率因子
@@ -152,7 +174,7 @@ class InvertedResidualConfig:
         self.kernel = kernel
         self.expanded_c = self.input_c * expanded_ratio
         self.out_c = self.adjust_channels(out_channel, width_coefficient)
-        self.use_cbam = use_cbam
+        self.use_se = use_se
         self.stride = stride
         self.drop_rate = drop_rate
         self.index = index
@@ -195,8 +217,9 @@ class InvertedResidual(nn.Module):
                                                   norm_layer=norm_layer,
                                                   activation_layer=activation_layer)})
 
-        if cnf.use_cbam:
-            layers.update({"cbam": CBAM(cnf.expanded_c)})
+        if cnf.use_se:
+            layers.update({"se": SqueezeExcitation(cnf.input_c,
+                                                   cnf.expanded_c)})
 
         # project
         layers.update({"project_conv": ConvBNActivation(cnf.expanded_c,
@@ -295,6 +318,13 @@ class EfficientNet(nn.Module):
         # build top
         last_conv_input_c = inverted_residual_setting[-1].out_c
         last_conv_output_c = adjust_channels(1280)
+
+        # 插入CBAM模块
+        cbam_channels = last_conv_input_c
+        self.cbam = CBAM(cbam_channels)
+
+        layers.update({"cbam": self.cbam})  # 在1x1卷积之前插入CBAM
+        
         layers.update({"top": ConvBNActivation(input_channel=last_conv_input_c,
                                                output_channel=last_conv_output_c,
                                                kernel_size=1,
