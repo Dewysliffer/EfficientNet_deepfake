@@ -310,13 +310,15 @@ class EfficientNet(nn.Module):
                                                      kernel_size=3,
                                                      stride=2,
                                                      norm_layer=norm_layer)})
+        # Add CBAM
+        layers.update({"cbam": CBAM(in_planes=cnf.out_c)})
 
         # building inverted residual blocks
         for cnf in inverted_residual_setting:
             layers.update({cnf.index: block(cnf, norm_layer)})
-            # Add CBAM after InvertedResidual but before ConvBNActivation
-            if cnf.index == inverted_residual_setting[-1].index:  # Insert CBAM before final ConvBNActivation
-                layers.update({"cbam": CBAM(in_planes=cnf.out_c)})
+
+        
+
 
         # build top
         last_conv_input_c = inverted_residual_setting[-1].out_c
